@@ -1,6 +1,7 @@
 # --- IMPORTS ---
 from flask import Flask, render_template, request, jsonify, redirect, url_for, g, make_response, session, flash
 from markupsafe import Markup
+from flask_wtf.csrf import CSRFProtect
 import sqlite3
 import pandas as pd
 import io
@@ -12,8 +13,42 @@ from datetime import datetime, timedelta
 import re
 import math
 import time  # ✅ اضافه شد برای نسخه‌دهی استاتیک
+import os
 
 app = Flask(__name__)
+# --- Session & Security (safe defaults; won't break current behavior) ---
+app.secret_key = os.getenv("HANI_SECRET_KEY", "dev-change-me")  # روی سرور مقدار امن بده
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,  # اگر روی HTTPS هستی True کن
+    PERMANENT_SESSION_LIFETIME=60*60*8,  # 8 ساعت
+)
+csrf = CSRFProtect(app)
+@app.after_request
+def add_security_headers(response):
+    # جلوگیری از MIME sniffing و کلیک‌جکینگ
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+
+    # CSP سبک که چیزی را نشکند:
+    # - اجازه به اسکریپت‌ها از خودت + jsDelivr + cdnjs + اسکریپت‌های inline (برای فعلاً)
+    # - اجازه استایل‌های inline (برای Bootstrap/RTL/…)
+    # - اجازه تصاویر data: (آیکون‌های باینری)
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://code.jquery.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
+        "img-src 'self' data:; "
+        "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net;"
+    )
+    # فقط اگر قبلاً دستی ست نشده:
+    if not response.headers.get("Content-Security-Policy"):
+        response.headers.set("Content-Security-Policy", csp)
+    return response
+
 # Persian digits filter (بعد از app = Flask(...))
 def fa_digits(value):
     if value is None:
@@ -24,7 +59,6 @@ def fa_digits(value):
 
 app.jinja_env.filters['fa'] = fa_digits
 
-app.secret_key = 'a_very_secret_key_for_hani_motor_final_tour_stable'
 DB_NAME = 'hami_motor_coding.db'
 
 # جلوگیری از کش استاتیک در حالت توسعه
@@ -89,8 +123,11 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         db = g._database = sqlite3.connect(DB_NAME)
+        db.execute("PRAGMA foreign_keys=ON;")   # فعال‌سازی قیود کلید خارجی
+        db.execute("PRAGMA journal_mode=WAL;")  # بهبود همزمانی/پایداری نوشتن
         db.row_factory = sqlite3.Row
     return db
+
 
 def ensure_user_created_at_column():
     db = get_db()
@@ -221,30 +258,106 @@ def add_user():
 @app.route('/edit_user/<int:user_id>', methods=['GET', 'POST'])
 @admin_required
 def edit_user(user_id):
-    db = get_db(); user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user: flash('کاربر مورد نظر یافت نشد.', 'danger'); return redirect(url_for('manage_users'))
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        flash('کاربر مورد نظر یافت نشد.', 'danger')
+        return redirect(url_for('manage_users'))
+
     if request.method == 'POST':
-        new_role, new_password = request.form['role'], request.form.get('password')
-        if user['username'] == 'admin' and new_role != 'admin': flash('امکان تغییر نقش کاربر اصلی ادمین وجود ندارد.', 'danger'); return redirect(url_for('edit_user', user_id=user_id))
+        # Get new values from the form
+        new_username = request.form.get('new_username').strip()
+        new_role = request.form.get('role')
+        new_password = request.form.get('password')
+        
+        # --- Start of New Logic ---
+        
+        current_username = user['username']
+        actions_logged = []
+
+        # 1. Handle Username Change
+        if new_username and new_username != current_username:
+            if current_username == 'admin':
+                flash('امکان تغییر نام کاربری اصلی ادمین وجود ندارد.', 'danger')
+                return redirect(url_for('manage_users'))
+            
+            # Check if the new username is already taken
+            existing_user = db.execute("SELECT id FROM users WHERE username = ? AND id != ?", (new_username, user_id)).fetchone()
+            if existing_user:
+                flash(f'نام کاربری «{new_username}» قبلاً توسط کاربر دیگری استفاده شده است.', 'danger')
+                return redirect(url_for('manage_users'))
+            
+            db.execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
+            actions_logged.append(f"نام کاربری '{current_username}' را به '{new_username}' تغییر داد.")
+            current_username = new_username # Update for subsequent logs
+
+        # 2. Handle Role Change
+        if new_role and new_role != user['role']:
+            if user['username'] == 'admin' and new_role != 'admin':
+                flash('امکان تغییر نقش کاربر اصلی ادمین وجود ندارد.', 'danger')
+                return redirect(url_for('manage_users'))
+            
+            db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
+            actions_logged.append(f"نقش کاربر '{current_username}' را به '{new_role}' تغییر داد.")
+
+        # 3. Handle Password Change
         if new_password:
             is_strong, message = is_password_strong(new_password)
             if not is_strong:
-                flash(message, 'danger'); return redirect(url_for('edit_user', user_id=user_id))
-            db.execute("UPDATE users SET password_hash = ?, role = ? WHERE id = ?", (hash_password(new_password), new_role, user_id)); log_activity(f"اطلاعات کاربر '{user['username']}' (نقش و رمز عبور) را ویرایش کرد.", user_id)
+                flash(message, 'danger')
+                return redirect(url_for('manage_users'))
+            
+            db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_password), user_id))
+            actions_logged.append(f"رمز عبور کاربر '{current_username}' را تغییر داد.")
+
+        # 4. Commit and Log
+        if actions_logged:
+            db.commit()
+            for action in actions_logged:
+                log_activity(action, user_id)
+            flash(f"اطلاعات کاربر {current_username} با موفقیت به‌روزرسانی شد.", 'success')
         else:
-            db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id)); log_activity(f"نقش کاربر '{user['username']}' را به '{new_role}' تغییر داد.", user_id)
-        db.commit(); flash(f"اطلاعات کاربر {user['username']} با موفقیت به‌روزرسانی شد.", 'success')
+            flash('هیچ تغییری برای ذخیره وجود نداشت.', 'info')
+            
+        # --- End of New Logic ---
+
         return redirect(url_for('manage_users'))
+
+    # This part for GET request remains the same
     return render_template('edit_user.html', user=user)
 
 @app.route('/delete_user/<int:user_id>', methods=['POST'])
 @admin_required
 def delete_user(user_id):
-    db = get_db(); user = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
-    if user and user['username'] == 'admin': flash('امکان حذف کاربر اصلی ادمین وجود ندارد.', 'danger')
-    elif user:
-        db.execute("DELETE FROM users WHERE id = ?", (user_id,)); db.commit()
-        log_activity(f"کاربر '{user['username']}' را حذف کرد.", user_id); flash(f"کاربر {user['username']} با موفقیت حذف شد.", 'success')
+    db = get_db()
+    user = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+
+    if not user:
+        flash('کاربر مورد نظر یافت نشد.', 'danger')
+        return redirect(url_for('manage_users'))
+
+    if user['username'] == 'admin':
+        flash('امکان حذف کاربر اصلی ادمین وجود ندارد.', 'danger')
+        return redirect(url_for('manage_users'))
+    
+    try:
+        # --- START: منطق جدید برای حل مشکل Foreign Key ---
+        # قبل از حذف کاربر، وابستگی‌های او را در جداول دیگر به NULL تغییر می‌دهیم
+        db.execute("UPDATE activity_log SET user_id = NULL WHERE user_id = ?", (user_id,))
+        db.execute("UPDATE notifications SET user_id = NULL WHERE user_id = ?", (user_id,))
+        
+        # حالا کاربر را با خیال راحت حذف می‌کنیم
+        db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        db.commit()
+        # --- END: پایان منطق جدید ---
+
+        log_activity(f"کاربر '{user['username']}' را حذف کرد.", user_id)
+        flash(f"کاربر {user['username']} با موفقیت حذف شد.", 'success')
+    
+    except sqlite3.Error as e:
+        db.rollback()
+        flash(f'خطا در حذف کاربر: {e}', 'danger')
+
     return redirect(url_for('manage_users'))
 
 # --- Main Application Routes (UNCHANGED)---
@@ -803,8 +916,6 @@ def search_parameters():
     results_raw = db.execute(query, (f'%{term}%',)).fetchall()
     return jsonify([dict(row) for row in results_raw])
 
-# =================== END OF CHANGED/NEW SECTIONS ===================
-
 # --- NEW ROUTE FOR VIEWING SAVED CODE DETAILS ---
 @app.route('/code_details/<int:code_id>')
 @login_required
@@ -872,4 +983,4 @@ def mark_notifications_read():
     return jsonify({'success': True})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=81)
+    app.run(host='0.0.0.0', port=81, debug=True)
